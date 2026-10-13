@@ -1,19 +1,5 @@
-from selenium import webdriver
-from selenium.common.exceptions import TimeoutException
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.remote.webelement import WebElement
-from selenium.webdriver.support.ui import WebDriverWait
-
-
-options = Options()
-options.debugger_address = "localhost:9222"
-driver = webdriver.Chrome(options=options)
-driver.implicitly_wait(1)
-url_start = driver.current_url
-driver.get(url_start)
-
+"""Execute one Query Masking Authorized Role entry."""
+"""
 # Required actions.
 # Hit plus button
 # <span class="ps-button-wrapper" title="Add a New Value"><a id="PTS_ADDMODE_BTN" class="ps-button" role="button" aria-pressed="false" onclick="javascript:cancelBubble(event);" href="javascript:submitAction_win0(document.win0,'PTS_ADDMODE_BTN');"><img src="/cs/sa92dev/cache/cache082826a/PT_ROW_ADD_32_302.SVG" id="PTS_ADDMODE_BTN$IMG" class="ps-img" alt=""><span class="ps-text">Add</span></a></span>
@@ -62,6 +48,86 @@ driver.get(url_start)
 
 # Input CSVs will contain "ROLENAME","RECNAME","FIELDNAME"
 # Should process one rolename and recname and fieldnames assosciated with it.
+"""
 
+
+import time
+
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import Select, WebDriverWait
+
+def addNewRole():
+    #record = wait.until(EC.element_to_be_clickable((By.ID, "RECNAME$0")))
+    #record.send_keys(record_name)
+    #record.send_keys(Keys.TAB)
+    pass
+
+
+def execute(role_name, record_name, field_name, port=9222):
+    options = Options()
+    options.debugger_address = f"localhost:{port}"
+    driver = webdriver.Chrome(options=options)
+    driver.implicitly_wait(1)
+    start_url = driver.current_url
+    driver.get(start_url)
+
+
+    wait = WebDriverWait(driver, 5, 0.25)
+
+    #driver.switch_to.default_content()
+    #wait.until(
+    #    EC.frame_to_be_available_and_switch_to_it((By.ID, "ptifrmtgtframe"))
+    #)
+
+    add_new = wait.until(EC.element_to_be_clickable((By.ID, "PTS_ADDMODE_BTN")))
+    driver.execute_script("arguments[0].click();", add_new)
+
+    role = wait.until(
+        EC.element_to_be_clickable((By.ID, "PTS_FILTER_NOOP_PTS_PROMPT2$0"))
+    )
+    role.send_keys(role_name)
+    role.send_keys(Keys.TAB)
+
+    wait.until(EC.invisibility_of_element_located((By.ID, "WAIT_win0")))
+    
+    add = wait.until(EC.element_to_be_clickable((By.ID, "PTS_SRCH_BTN")))
+    driver.execute_script("arguments[0].click();", add)
+    wait.until(EC.invisibility_of_element_located((By.ID, "WAIT_win0")))
+
+    # there are two possible paths here
+    #add_rec = wait.until(EC.element_to_be_clickable((By.ID, "PTS_ADDMODE_BTN")))
+    #driver.execute_script("arguments[0].click();", add_rec)
+
+    
+    #record = wait.until(EC.element_to_be_clickable((By.ID, "RECNAME$0")))
+    #record.send_keys(record_name)
+    #record.send_keys(Keys.TAB)
+
+    '''
+    field = wait.until(
+        EC.element_to_be_clickable((By.ID, "EODP_ROLRECFLD_FIELDNAME$0"))
+    )
+    field.send_keys(field_name)
+    field.send_keys(Keys.TAB)
+
+    access = wait.until(
+        EC.element_to_be_clickable((By.ID, "EODP_ROLRECFLD_EODP_ACCESS_CD$0"))
+    )
+    Select(access).select_by_value("Y")
+
+    save = wait.until(
+        EC.element_to_be_clickable((By.ID, "EODP_RRF_WRK_SAVE_PB"))
+    )
+    driver.execute_script("arguments[0].click();", save)
+    time.sleep(0.25)
+    wait.until(EC.invisibility_of_element_located((By.ID, "WAIT_win0")))
+    '''
+print("hello world")
+execute("UHCSS_SR_QUERY_SHOW_FULL_DOB","UHS_ADMPERS2_VW","BIRTHDATE")
+# UHS_CS_SECFORM_CHGS
 
 
