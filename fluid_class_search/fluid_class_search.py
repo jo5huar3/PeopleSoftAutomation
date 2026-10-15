@@ -1,7 +1,7 @@
 """Compare course counts in a CSV with PeopleSoft Fluid Class Search.
 
 Expected command-line input:
-    python fluid_class_search.py <environment> <csv_path>
+    python fluid_class_search.py <environment> <csv_path> <process_count>
 
 <environment> is TST, DEV, or PRD (the keys in login_pages below).
 <csv_path> is a CSV with a header row and at least five columns. The fourth
@@ -9,12 +9,13 @@ column (index 3) must contain the subject code, such as MATH; the fifth
 column (index 4) must contain the course number, such as 1300. Each data row
 represents one class option. Repeated subject/course pairs are counted and
 compared with the number of options returned by Fluid Class Search.
+<process_count> is the number of independent browser workers to launch.
 
-The script opens ten isolated Chrome sessions. Sign in separately and navigate
-each browser to the Fluid Class Search starting page, then press Enter in the
-terminal once every browser is ready. The script writes discrepancies and
-search errors to a text file named after the input CSV with
-_FluidSearchResult.txt appended to its base name.
+The script opens all isolated Chrome sessions at once. Sign in and navigate
+every browser to Fluid Class Search, then return to the terminal and press
+Enter once to start every worker. The script writes discrepancies and search
+errors to a text file named after the input CSV with _FluidSearchResult.txt
+appended to its base name.
 """
 
 import sys
@@ -28,9 +29,7 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.by import By
 from selenium.common.exceptions import NoSuchElementException
 
-NUM_PROCESS = 10
 SEARCH_PAUSE_SECONDS = 0.5
-WORKER_START_TIMEOUT_SECONDS = 120
 RESULT_MESSAGE_SELECTOR = "[id$='divPTS_SEARCHED_KW2']"
 CLASS_COUNT_SELECTOR = "[id$='divPTS_LIST_SUMMARY$0']"
 
@@ -73,7 +72,6 @@ def Search_for_Courses(
     worker_number: int,
     ready_queue: Queue,
     start_event: Event,
-    cancel_event: Event,
 ):
     """Run one independently authenticated Fluid Class Search worker.
 
@@ -86,9 +84,8 @@ def Search_for_Courses(
         database: A key in ``login_pages`` identifying TST, DEV, or PRD.
         worker_number: One-based number used in operator and error messages.
         ready_queue: Queue notified after this worker's login browser opens.
-        start_event: Event set after the operator has signed into every browser
-            and navigated each one to Fluid Class Search.
-        cancel_event: Event set when startup fails and all workers must exit.
+        start_event: Event set after the operator has signed into this browser
+            and navigated it to Fluid Class Search.
 
     Returns:
         None. Results and failures are placed on their respective queues, and
@@ -115,8 +112,6 @@ def Search_for_Courses(
         startup_reported = True
 
         start_event.wait()
-        if cancel_event.is_set():
-            return
 
         initial_url = driver.current_url
         if not driver.find_elements(By.ID, "PTS_KEYWORDS3"):
@@ -206,13 +201,18 @@ def Search_for_Courses(
         if driver is not None:
             driver.quit()
 
-def Split_Dictionary(classes : dict[list], classes_p : list[dict]):
+def Split_Dictionary(
+    classes: dict[list],
+    classes_p: list[dict],
+    process_count: int,
+):
     """Distribute individual courses evenly across the configured workers.
 
     Args:
         classes: Subject keys mapped to lists of Course objects.
         classes_p: An initially empty list populated with one subject/course
             dictionary for each worker.
+        process_count: Positive number of worker dictionaries to create.
 
     Returns:
         None. ``classes_p`` is modified in place. Courses are distributed in
@@ -223,100 +223,84 @@ def Split_Dictionary(classes : dict[list], classes_p : list[dict]):
         this function performs no browser or filesystem operations.
     """
 
-    [classes_p.append({}) for _ in range(NUM_PROCESS)]
+    classes_p.extend({} for _ in range(process_count))
     i = 0
     for subject, courses in classes.items():
         for course in courses:
-            worker_classes = classes_p[i % NUM_PROCESS]
+            worker_classes = classes_p[i % process_count]
             worker_classes.setdefault(subject, []).append(course)
             i += 1
 
-def StartProcesses(database, classes : dict[list[Course]]):
+def StartProcesses(
+    database: str,
+    classes: dict[list[Course]],
+    process_count: int,
+):
     """Launch independent authenticated browsers and run parallel searches.
 
     Args:
         database: A key in ``login_pages`` identifying TST, DEV, or PRD.
         classes: Subject keys mapped to Course objects built from the input
             CSV.
+        process_count: Positive number of independent Chrome workers to run.
 
     Returns:
         A list of discrepancy and failure lines for the output text file.
 
     Failure behavior:
-        Raises RuntimeError if any browser cannot reach its login page within
-        the startup timeout. Before searches begin, the operator must sign in
-        and navigate every browser to Fluid Class Search. Individual search
-        failures are printed and returned as error lines instead of stopping
-        the remaining workers.
+        Waits indefinitely for every browser to report that it opened, then
+        waits for one Enter press after the operator prepares all browsers.
+        Raises RuntimeError if a browser reports a startup failure. Individual
+        search failures are printed and returned as error lines instead of
+        stopping the remaining workers.
     """
 
     line_buffer = []
     classes_p = []
-    Split_Dictionary(classes, classes_p)
+    Split_Dictionary(classes, classes_p, process_count)
     process_list = []
     queue = Queue()
     failed_search_queue = Queue()
     ready_queue = Queue()
     start_event = Event()
-    cancel_event = Event()
 
     print(
-        f"Opening {NUM_PROCESS} independent Chrome sessions. Each browser "
-        "uses its own temporary profile and PeopleSoft session."
+        f"Preparing {process_count} independent Chrome sessions. Each "
+        "browser uses its own temporary profile and PeopleSoft session."
     )
-    for i, worker_classes in enumerate(classes_p, start=1):
-        process = Process(
-            target=Search_for_Courses,
-            args=(
-                worker_classes,
-                queue,
-                failed_search_queue,
-                database,
-                i,
-                ready_queue,
-                start_event,
-                cancel_event,
-            ),
-        )
-        process.start()
-        process_list.append(process)
-
-    startup_errors = []
-    startup_deadline = time.monotonic() + WORKER_START_TIMEOUT_SECONDS
-    try:
-        for _ in process_list:
-            remaining = startup_deadline - time.monotonic()
-            if remaining <= 0:
-                raise Empty
-            worker_number, error = ready_queue.get(timeout=remaining)
-            if error:
-                startup_errors.append(error)
-            else:
-                print(f"  Worker {worker_number}/{NUM_PROCESS} browser opened.")
-    except Empty:
-        startup_errors.append(
-            f"Not all browsers opened within "
-            f"{WORKER_START_TIMEOUT_SECONDS} seconds."
-        )
-
-    if startup_errors:
-        cancel_event.set()
-        start_event.set()
-        for process in process_list:
-            process.join(timeout=10)
-            if process.is_alive():
-                process.terminate()
-                process.join()
-        raise RuntimeError(" ".join(startup_errors))
-
     failed_searches = []
     try:
+        for i, worker_classes in enumerate(classes_p, start=1):
+            process = Process(
+                target=Search_for_Courses,
+                args=(
+                    worker_classes,
+                    queue,
+                    failed_search_queue,
+                    database,
+                    i,
+                    ready_queue,
+                    start_event,
+                ),
+            )
+            process.start()
+            process_list.append(process)
+
+        # There is deliberately no timeout. The command line waits until
+        # every browser reports that its login page has opened.
+        for _ in process_list:
+            worker_number, error = ready_queue.get()
+            if error:
+                raise RuntimeError(error)
+            print(f"  Worker {worker_number}/{process_count} browser opened.")
+
         input(
-            f"\nSign in separately in all {NUM_PROCESS} Chrome windows and "
-            "navigate every window to the Fluid Class Search starting page.\n"
-            "Press Enter here only after all windows are ready... "
+            f"\nSign in and navigate all {process_count} browsers to the "
+            "Fluid Class Search starting page.\nPress Enter once when every "
+            "window is ready... "
         )
         start_event.set()
+
         # Drain worker queues while processes are running. This prevents a
         # worker with many failures from blocking on a full multiprocessing
         # queue while the parent is waiting for that worker to exit.
@@ -335,13 +319,11 @@ def StartProcesses(database, classes : dict[list[Course]]):
         for process in process_list:
             process.join()
     except BaseException:
-        cancel_event.set()
         start_event.set()
         for process in process_list:
-            process.join(timeout=10)
             if process.is_alive():
                 process.terminate()
-                process.join()
+            process.join()
         raise
 
     while True:
@@ -376,10 +358,33 @@ def Find_Course_Index(courses : list[Course], course_number):
     return None
 
 if __name__ == "__main__":
+    if len(sys.argv) != 4:
+        print(
+            "Usage: python fluid_class_search.py "
+            "<TST|DEV|PRD> <csv_path> <process_count>",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    database = sys.argv[1].upper()
+    csv_path = sys.argv[2]
+    if database not in login_pages:
+        print("Environment must be TST, DEV, or PRD.", file=sys.stderr)
+        sys.exit(2)
+
+    try:
+        process_count = int(sys.argv[3])
+    except ValueError:
+        print("process_count must be a positive integer.", file=sys.stderr)
+        sys.exit(2)
+    if process_count < 1:
+        print("process_count must be a positive integer.", file=sys.stderr)
+        sys.exit(2)
+
     classes = {}
     # Argument 2 is the input CSV path. csv.reader returns each row as a list
     # of strings; the first row is a header and is skipped.
-    with open(sys.argv[2], 'r') as csv_file:
+    with open(csv_path, 'r') as csv_file:
         # row[3] is the subject code; row[4] is the course number. Each
         # repeated pair adds one to the expected class-option count.
                 csv_reader = csv.reader(csv_file)
@@ -394,8 +399,8 @@ if __name__ == "__main__":
                     else:
                        classes[row[3]] = [Course(row[3], row[4])]
          
-    output_filename = sys.argv[2].split(".")[0] + "_FluidSearchResult.txt"
+    output_filename = csv_path.rsplit(".", 1)[0] + "_FluidSearchResult.txt"
     with open(output_filename, 'w') as file:
         # Argument 1 selects the PeopleSoft environment: TST, DEV, or PRD.
-       file.writelines(StartProcesses(sys.argv[1], classes))
+       file.writelines(StartProcesses(database, classes, process_count))
     print("Results at " + output_filename)
