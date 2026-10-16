@@ -7,11 +7,12 @@ Usage::
         --diagnostic-output diagnostics.txt --summary-output summary.txt \
         --csv-output class_issues.csv
 
-Only subject/catalog pairs in the explicitly supplied ``course_list_txt`` are
+The CSV is the required source. When ``--course-list`` is supplied, only its
+subject/catalog pairs are checked; without it, every course in the CSV is
 checked. Three explicitly named outputs separate full diagnostics, a readable
 one-line-per-issue summary, and structured class-number issues. The diagnostic
-file is the only file that contains stack traces. The CSV is retained only when
-at least one class number is missing, unexpected, or could not be verified.
+file is the only file that contains stack traces. The CSV report is retained
+only when a class number is missing, unexpected, or could not be verified.
 """
 
 import argparse
@@ -190,13 +191,21 @@ def Find_Course_Index(courses: list[Course], course_number: str) -> int | None:
 
 
 def Load_Filtered_Courses(csv_path: str,
-                          allowed_courses: set[tuple[str, str]],
+                          allowed_courses: set[tuple[str, str]] | None = None,
                           ) -> tuple[dict[str, list[Course]], list[str]]:
-    """Load unique class rows only for subject/catalog keys in the allowlist.
+    """Load unique CSV class rows, optionally restricted by an allowlist.
 
-    csv_path must have every REQUIRED_CSV_COLUMNS header. Returns a grouped
-    Course dictionary and the original header order. File/CSV errors propagate;
-    ValueError reports absent headers or blank required values.
+    Args:
+        csv_path: Source CSV containing every REQUIRED_CSV_COLUMNS header.
+        allowed_courses: Optional normalized subject/catalog keys. None loads
+            every course; a set loads only matching courses.
+
+    Returns:
+        A grouped Course dictionary and the original CSV header order.
+
+    Failure behavior:
+        File and CSV errors propagate. ValueError reports absent headers or
+        blank required values. An empty allowlist intentionally loads nothing.
     """
     classes: dict[str, list[Course]] = {}
     with open(csv_path, "r", encoding="utf-8-sig", newline="") as csv_file:
@@ -230,7 +239,10 @@ def Load_Filtered_Courses(csv_path: str,
             subject, course_number = Normalize_Course_Key(
                 row["SUBJECT"], row["CATALOG_NBR"]
             )
-            if (subject, course_number) not in allowed_courses:
+            if (
+                allowed_courses is not None
+                and (subject, course_number) not in allowed_courses
+            ):
                 continue
             index = Find_Course_Index(classes.get(subject, []), course_number)
             if index is None:
@@ -928,10 +940,10 @@ def Parse_Arguments(arguments: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--course-list",
-        required=True,
         help=(
-            "Text file whose SUBJECT CATALOG_NBR entries select the courses "
-            "to run. This input file is not overwritten."
+            "Optional text file whose SUBJECT CATALOG_NBR entries restrict "
+            "the courses to run. Omit it to process every course in the CSV. "
+            "This input file is not overwritten."
         ),
     )
     parser.add_argument(
@@ -975,8 +987,11 @@ def Parse_Arguments(arguments: list[str] | None = None) -> argparse.Namespace:
         )
     input_paths = {
         os.path.normcase(os.path.abspath(options.csv_path)),
-        os.path.normcase(os.path.abspath(options.course_list)),
     }
+    if options.course_list:
+        input_paths.add(
+            os.path.normcase(os.path.abspath(options.course_list))
+        )
     if output_paths & input_paths:
         parser.error("output files cannot overwrite --csv-path or --course-list")
     return options
@@ -1007,9 +1022,13 @@ def Main(arguments: list[str] | None = None) -> int:
     process_count = options.process_count
 
     try:
-        # Every input/output path is explicit. The course-list input is read
-        # only and is never selected by naming convention or overwritten.
-        allowlist = Load_Course_Allowlist(course_list_path)
+        # The CSV is always the source. A course list is an optional explicit
+        # filter and is never inferred from the CSV filename.
+        allowlist = (
+            Load_Course_Allowlist(course_list_path)
+            if course_list_path
+            else None
+        )
         classes, _ = Load_Filtered_Courses(csv_path, allowlist)
     except (OSError, ValueError, csv.Error) as exc:
         print(f"Input error: {type(exc).__name__}: {exc}", file=sys.stderr)
@@ -1019,15 +1038,25 @@ def Main(arguments: list[str] | None = None) -> int:
         (subject, course.Get_Course_Number())
         for subject, courses in classes.items() for course in courses
     }
-    preflight_lines = [
-        f"{subject} {catalog}: Expected unknown; missing unknown. Listed in "
-        "the course-list file but not present in the input CSV.\n"
-        for subject, catalog in sorted(allowlist - loaded_keys)
-    ]
-    print(
-        f"Loaded {len(loaded_keys)} course(s) from {csv_path} selected by "
-        f"{course_list_path}."
+    preflight_lines = (
+        [
+            f"{subject} {catalog}: Expected unknown; missing unknown. Listed "
+            "in the course-list file but not present in the input CSV.\n"
+            for subject, catalog in sorted(allowlist - loaded_keys)
+        ]
+        if allowlist is not None
+        else []
     )
+    if course_list_path:
+        print(
+            f"Loaded {len(loaded_keys)} course(s) from {csv_path} selected by "
+            f"{course_list_path}."
+        )
+    else:
+        print(
+            f"Loaded all {len(loaded_keys)} course(s) from {csv_path}; no "
+            "course-list filter was supplied."
+        )
     if classes:
         diagnostic_lines, summary_lines, issue_rows = StartProcesses(
             database, classes, process_count
