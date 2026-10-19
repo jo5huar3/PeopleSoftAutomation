@@ -2,17 +2,18 @@
 
 Usage::
 
-    python fluid_class_search.py --environment PRD --csv-path classes.csv \
-        --course-list prior_results.txt --process-count 10 \
+    python fluid_class_search.py --environment PRD \
+        --course-list prior_results.csv --process-count 10 \
         --diagnostic-output diagnostics.txt --summary-output summary.txt \
         --csv-output class_issues.csv
 
-The CSV is the required source. When ``--course-list`` is supplied, only its
-subject/catalog pairs are checked; without it, every course in the CSV is
-checked. Three explicitly named outputs separate full diagnostics, a readable
-one-line-per-issue summary, and structured class-number issues. The diagnostic
-file is the only file that contains stack traces. The CSV report is retained
-only when a class number is missing, unexpected, or could not be verified.
+Exactly one data source is required: ``--csv-path`` or ``--course-list``. A CSV
+source must contain SUBJECT, CATALOG_NBR, and CLASS_NBR. A text course list must
+contain the clean-summary ``Expected class numbers: ...`` values. Three
+explicitly named outputs separate full diagnostics, a readable one-line-per-
+issue summary, and structured class-number issues. The diagnostic file is the
+only file that contains stack traces. The CSV report is retained only when a
+class number is missing, unexpected, or could not be verified.
 """
 
 import argparse
@@ -52,10 +53,7 @@ DETAIL_ROW_SELECTOR = (
 DETAIL_COMPONENT_SELECTOR = (
     "[id*='SSR_CMPNT_DESCR_'][title='Class Number']"
 )
-REQUIRED_CSV_COLUMNS = (
-    "INSTITUTION", "ACAD_CAREER", "STRM", "SUBJECT", "CATALOG_NBR",
-    "CLASS_NBR",
-)
+COURSE_CSV_COLUMNS = ("SUBJECT", "CATALOG_NBR", "CLASS_NBR")
 ISSUE_CSV_COLUMNS = (
     "SUBJECT", "CATALOG_NBR", "CLASS_NBR", "ISSUE", "REASON",
 )
@@ -73,7 +71,7 @@ class Course:
     Args:
         subject: Nonblank CSV SUBJECT value.
         course_number: Nonblank CSV CATALOG_NBR value.
-        source_row: First complete source row, including CLASS_NBR.
+        source_row: First source row containing CLASS_NBR.
 
     Behavior:
         Rows are keyed by CLASS_NBR, preventing duplicate input rows from
@@ -150,32 +148,118 @@ def Normalize_Course_Key(subject: str, course_number: str) -> tuple[str, str]:
     return subject.strip().upper(), course_number.strip().upper()
 
 
-def Load_Course_Allowlist(result_path: str) -> set[tuple[str, str]]:
-    """Read unique ``SUBJECT CATALOG_NBR:`` keys from a prior text report.
+def Extract_Text_Expected_Class_Numbers(line: str) -> set[str] | None:
+    """Extract expected CLASS_NBR values from one summary-report line.
 
-    result_path must name a readable text file. Detail and traceback lines are
-    ignored. Filesystem errors propagate, and ValueError is raised if no
-    course-prefixed lines can be parsed.
+    Args:
+        line: Course-prefixed clean-summary line. Current lines use
+            ``Expected class numbers:``; older detailed lines may use
+            ``CSV class numbers (N):``.
+
+    Returns:
+        A set of numeric class-number strings, or None when neither supported
+        expected-list marker exists on the line.
+
+    Failure behavior:
+        Raises ValueError when a marker exists but its comma-separated value
+        contains a nonnumeric or empty class number.
     """
-    # Restrict both tokens to course-like values. This prevents traceback text
-    # such as ``(SESSION INFO:`` from becoming a false allowlist entry.
+    list_match = re.search(
+        r"Expected class numbers:\s*([^.;\r\n]+)",
+        line,
+        re.IGNORECASE,
+    )
+    if list_match is None:
+        list_match = re.search(
+            r"CSV class numbers\s*\(\d+\):\s*([^;\r\n]+)",
+            line,
+            re.IGNORECASE,
+        )
+    if list_match is None:
+        return None
+
+    values = {value.strip() for value in list_match.group(1).split(",")}
+    if not values or "" in values or any(
+        not value.isdigit() for value in values
+    ):
+        raise ValueError(
+            "Expected class-number list must contain comma-separated digits"
+        )
+    return values
+
+
+def Load_Courses_From_Text_List(
+    course_list_path: str,
+) -> dict[str, list[Course]]:
+    """Build complete Course objects from a clean-summary text file.
+
+    Args:
+        course_list_path: Text file with ``SUBJECT CATALOG_NBR:`` lines that
+            also include an explicit expected/CSV class-number list.
+
+    Returns:
+        Subject keys mapped to Course objects containing every expected class
+        number found in the text file.
+
+    Failure behavior:
+        Filesystem and decoding errors propagate. ValueError identifies course
+        lines lacking class-number lists, malformed lists, or a file with no
+        usable courses. This prevents a key-only text list from silently using
+        an empty expected set.
+    """
     course_pattern = re.compile(
         r"^\s*([A-Z][A-Z0-9]*)\s+([A-Z0-9][A-Z0-9.-]*)\s*:",
         re.IGNORECASE,
     )
-    allowed_courses: set[tuple[str, str]] = set()
-    with open(result_path, "r", encoding="utf-8") as result_file:
-        for line in result_file:
-            match = course_pattern.match(line)
-            if match:
-                allowed_courses.add(
-                    Normalize_Course_Key(match.group(1), match.group(2))
-                )
-    if not allowed_courses:
-        raise ValueError(
-            f"No 'SUBJECT CATALOG_NBR:' entries found in {result_path}"
+    classes: dict[str, list[Course]] = {}
+    incomplete_lines: list[int] = []
+    with open(course_list_path, "r", encoding="utf-8-sig") as course_file:
+        for line_number, line in enumerate(course_file, start=1):
+            course_match = course_pattern.match(line)
+            if course_match is None:
+                continue
+            class_numbers = Extract_Text_Expected_Class_Numbers(line)
+            if class_numbers is None:
+                incomplete_lines.append(line_number)
+                continue
+
+            subject, course_number = Normalize_Course_Key(
+                course_match.group(1), course_match.group(2)
+            )
+            course_index = Find_Course_Index(
+                classes.get(subject, []), course_number
+            )
+            for class_number in sorted(class_numbers):
+                source_row = {
+                    "SUBJECT": subject,
+                    "CATALOG_NBR": course_number,
+                    "CLASS_NBR": class_number,
+                }
+                if course_index is None:
+                    classes.setdefault(subject, []).append(
+                        Course(subject, course_number, source_row)
+                    )
+                    course_index = len(classes[subject]) - 1
+                else:
+                    classes[subject][course_index].Add_Source_Row(source_row)
+
+    if incomplete_lines:
+        line_preview = ", ".join(
+            str(line_number) for line_number in incomplete_lines[:10]
         )
-    return allowed_courses
+        extra_count = len(incomplete_lines) - 10
+        if extra_count > 0:
+            line_preview += f" and {extra_count} more"
+        raise ValueError(
+            "Text course-list entries must include 'Expected class numbers:' "
+            "or the older 'CSV class numbers (N):' list; missing on line(s) "
+            + line_preview
+        )
+    if not classes:
+        raise ValueError(
+            f"No usable course entries found in {course_list_path}"
+        )
+    return classes
 
 
 def Find_Course_Index(courses: list[Course], course_number: str) -> int | None:
@@ -190,31 +274,38 @@ def Find_Course_Index(courses: list[Course], course_number: str) -> int | None:
     return None
 
 
-def Load_Filtered_Courses(csv_path: str,
-                          allowed_courses: set[tuple[str, str]] | None = None,
-                          ) -> tuple[dict[str, list[Course]], list[str]]:
-    """Load unique CSV class rows, optionally restricted by an allowlist.
+def Load_Courses_From_Csv(
+    csv_path: str,
+) -> tuple[dict[str, list[Course]], list[str]]:
+    """Load unique expected class rows from a standalone CSV source.
 
     Args:
-        csv_path: Source CSV containing every REQUIRED_CSV_COLUMNS header.
-        allowed_courses: Optional normalized subject/catalog keys. None loads
-            every course; a set loads only matching courses.
+        csv_path: ``--csv-path`` or CSV ``--course-list`` containing SUBJECT,
+            CATALOG_NBR, and CLASS_NBR. Other columns are accepted and ignored
+            by the comparison.
 
     Returns:
         A grouped Course dictionary and the original CSV header order.
 
     Failure behavior:
         File and CSV errors propagate. ValueError reports absent headers or
-        blank required values. An empty allowlist intentionally loads nothing.
+        blank required values, or a file with no usable expected class rows.
+        Rows marked UNEXPECTED_IN_FLUID in a prior issue CSV are skipped because
+        they were not part of the original expected set.
     """
     classes: dict[str, list[Course]] = {}
     with open(csv_path, "r", encoding="utf-8-sig", newline="") as csv_file:
         reader = csv.DictReader(csv_file)
         if reader.fieldnames is None:
             raise ValueError(f"CSV has no header row: {csv_path}")
+        header_lookup = {
+            header.strip().upper(): header
+            for header in reader.fieldnames
+            if header is not None
+        }
         missing_columns = [
-            column for column in REQUIRED_CSV_COLUMNS
-            if column not in reader.fieldnames
+            column for column in COURSE_CSV_COLUMNS
+            if column not in header_lookup
         ]
         if missing_columns:
             raise ValueError(
@@ -222,14 +313,24 @@ def Load_Filtered_Courses(csv_path: str,
             )
 
         for line_number, raw_row in enumerate(reader, start=2):
-            # None is possible on a malformed short row; turn it into a clear
-            # required-value validation error.
             row = {
                 column: (value or "").strip()
                 for column, value in raw_row.items() if column is not None
             }
+            # Add canonical core keys even when the CSV used lowercase or
+            # whitespace-padded headers.
+            for column in COURSE_CSV_COLUMNS:
+                row[column] = (
+                    raw_row.get(header_lookup[column]) or ""
+                ).strip()
+            issue_header = header_lookup.get("ISSUE")
+            if issue_header and (
+                raw_row.get(issue_header) or ""
+            ).strip().upper() == "UNEXPECTED_IN_FLUID":
+                continue
+
             blank_columns = [
-                column for column in REQUIRED_CSV_COLUMNS if not row.get(column)
+                column for column in COURSE_CSV_COLUMNS if not row.get(column)
             ]
             if blank_columns:
                 raise ValueError(
@@ -239,11 +340,6 @@ def Load_Filtered_Courses(csv_path: str,
             subject, course_number = Normalize_Course_Key(
                 row["SUBJECT"], row["CATALOG_NBR"]
             )
-            if (
-                allowed_courses is not None
-                and (subject, course_number) not in allowed_courses
-            ):
-                continue
             index = Find_Course_Index(classes.get(subject, []), course_number)
             if index is None:
                 classes.setdefault(subject, []).append(
@@ -251,6 +347,8 @@ def Load_Filtered_Courses(csv_path: str,
                 )
             else:
                 classes[subject][index].Add_Source_Row(row)
+    if not classes:
+        raise ValueError(f"CSV contains no usable expected class rows: {csv_path}")
     return classes, list(reader.fieldnames)
 
 
@@ -933,17 +1031,20 @@ def Parse_Arguments(arguments: list[str] | None = None) -> argparse.Namespace:
         choices=sorted(login_pages),
         help="PeopleSoft environment: TST, DEV, or PRD.",
     )
-    parser.add_argument(
+    source_group = parser.add_mutually_exclusive_group(required=True)
+    source_group.add_argument(
         "--csv-path",
-        required=True,
-        help="Source CSV containing SUBJECT, CATALOG_NBR, and CLASS_NBR.",
+        help=(
+            "Primary CSV source containing SUBJECT, CATALOG_NBR, and "
+            "CLASS_NBR. Cannot be combined with --course-list."
+        ),
     )
-    parser.add_argument(
+    source_group.add_argument(
         "--course-list",
         help=(
-            "Optional text file whose SUBJECT CATALOG_NBR entries restrict "
-            "the courses to run. Omit it to process every course in the CSV. "
-            "This input file is not overwritten."
+            "Standalone source replacing --csv-path: either a CSV containing "
+            "SUBJECT, CATALOG_NBR, and CLASS_NBR, or a clean-summary text "
+            "report containing explicit expected class-number lists."
         ),
     )
     parser.add_argument(
@@ -985,15 +1086,12 @@ def Parse_Arguments(arguments: list[str] | None = None) -> argparse.Namespace:
             "--diagnostic-output, --summary-output, and --csv-output must "
             "name three different files"
         )
+    source_path = options.csv_path or options.course_list
     input_paths = {
-        os.path.normcase(os.path.abspath(options.csv_path)),
+        os.path.normcase(os.path.abspath(source_path)),
     }
-    if options.course_list:
-        input_paths.add(
-            os.path.normcase(os.path.abspath(options.course_list))
-        )
     if output_paths & input_paths:
-        parser.error("output files cannot overwrite --csv-path or --course-list")
+        parser.error("output files cannot overwrite the selected input source")
     return options
 
 
@@ -1022,14 +1120,18 @@ def Main(arguments: list[str] | None = None) -> int:
     process_count = options.process_count
 
     try:
-        # The CSV is always the source. A course list is an optional explicit
-        # filter and is never inferred from the CSV filename.
-        allowlist = (
-            Load_Course_Allowlist(course_list_path)
-            if course_list_path
-            else None
-        )
-        classes, _ = Load_Filtered_Courses(csv_path, allowlist)
+        # Exactly one standalone source is supplied. CSV course lists use the
+        # same complete row loader as --csv-path; text summaries carry their
+        # own expected class-number lists.
+        if csv_path:
+            classes, _ = Load_Courses_From_Csv(csv_path)
+            source_path = csv_path
+        elif os.path.splitext(course_list_path)[1].lower() == ".csv":
+            classes, _ = Load_Courses_From_Csv(course_list_path)
+            source_path = course_list_path
+        else:
+            classes = Load_Courses_From_Text_List(course_list_path)
+            source_path = course_list_path
     except (OSError, ValueError, csv.Error) as exc:
         print(f"Input error: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
@@ -1038,25 +1140,7 @@ def Main(arguments: list[str] | None = None) -> int:
         (subject, course.Get_Course_Number())
         for subject, courses in classes.items() for course in courses
     }
-    preflight_lines = (
-        [
-            f"{subject} {catalog}: Expected unknown; missing unknown. Listed "
-            "in the course-list file but not present in the input CSV.\n"
-            for subject, catalog in sorted(allowlist - loaded_keys)
-        ]
-        if allowlist is not None
-        else []
-    )
-    if course_list_path:
-        print(
-            f"Loaded {len(loaded_keys)} course(s) from {csv_path} selected by "
-            f"{course_list_path}."
-        )
-    else:
-        print(
-            f"Loaded all {len(loaded_keys)} course(s) from {csv_path}; no "
-            "course-list filter was supplied."
-        )
+    print(f"Loaded {len(loaded_keys)} course(s) from {source_path}.")
     if classes:
         diagnostic_lines, summary_lines, issue_rows = StartProcesses(
             database, classes, process_count
@@ -1064,8 +1148,6 @@ def Main(arguments: list[str] | None = None) -> int:
     else:
         diagnostic_lines, summary_lines, issue_rows = [], [], []
 
-    diagnostic_lines = preflight_lines + diagnostic_lines
-    summary_lines = preflight_lines + summary_lines
     with open(
         diagnostic_output_path, "w", encoding="utf-8", newline=""
     ) as output:
