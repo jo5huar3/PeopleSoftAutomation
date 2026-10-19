@@ -13,7 +13,7 @@ contain the clean-summary ``Expected class numbers: ...`` values. Three
 explicitly named outputs separate full diagnostics, a readable one-line-per-
 issue summary, and structured class-number issues. The diagnostic file is the
 only file that contains stack traces. The CSV report is retained only when a
-class number is missing, unexpected, or could not be verified.
+class number is missing or could not be verified.
 """
 
 import argparse
@@ -55,7 +55,12 @@ DETAIL_COMPONENT_SELECTOR = (
 )
 COURSE_CSV_COLUMNS = ("SUBJECT", "CATALOG_NBR", "CLASS_NBR")
 ISSUE_CSV_COLUMNS = (
-    "SUBJECT", "CATALOG_NBR", "CLASS_NBR", "ISSUE", "REASON",
+    "SUBJECT",
+    "CATALOG_NBR",
+    "CLASS_NBR",
+    "ISSUE",
+    "RETURNED_CLASS_NUMBERS",
+    "REASON",
 )
 
 login_pages = {
@@ -290,8 +295,8 @@ def Load_Courses_From_Csv(
     Failure behavior:
         File and CSV errors propagate. ValueError reports absent headers or
         blank required values, or a file with no usable expected class rows.
-        Rows marked UNEXPECTED_IN_FLUID in a prior issue CSV are skipped because
-        they were not part of the original expected set.
+        Rows marked UNEXPECTED_IN_FLUID in a legacy issue CSV are skipped
+        because they were not part of the original expected set.
     """
     classes: dict[str, list[Course]] = {}
     with open(csv_path, "r", encoding="utf-8-sig", newline="") as csv_file:
@@ -519,17 +524,20 @@ def Build_Class_Issue_Rows(
     class_numbers: set[str],
     issue: str,
     reason: str,
+    returned_class_numbers: set[str] | None = None,
 ) -> list[dict[str, str]]:
     """Build concise CSV issue rows for specified class numbers.
 
     Args:
         course: Course supplying SUBJECT and CATALOG_NBR.
-        class_numbers: Missing, unexpected, or unverified CLASS_NBR values.
+        class_numbers: Missing or unverified CLASS_NBR values.
         issue: Short machine-readable category such as MISSING_FROM_FLUID.
-        reason: Readable explanation of the incorrect or unverified field.
+        reason: Readable explanation without embedded class-number lists.
+        returned_class_numbers: Optional class numbers found in Fluid to place
+            in the dedicated RETURNED_CLASS_NUMBERS column.
 
     Returns:
-        One dictionary per unique class number containing only the five
+        One dictionary per unique class number containing only the six
         ISSUE_CSV_COLUMNS fields; numbers are emitted in stable sorted order.
 
     Failure behavior:
@@ -543,6 +551,10 @@ def Build_Class_Issue_Rows(
             "CATALOG_NBR": course.Get_Course_Number(),
             "CLASS_NBR": class_number,
             "ISSUE": issue,
+            "RETURNED_CLASS_NUMBERS": (
+                Format_Number_Set(returned_class_numbers)
+                if returned_class_numbers else ""
+            ),
             "REASON": reason,
         }
         for class_number in sorted(class_numbers)
@@ -686,10 +698,9 @@ def Search_for_Courses(classes: dict[str, list[Course]], result_queue: Queue,
                             result_title.click()
                             actual = Extract_Detail_Class_Numbers(driver)
                             missing = expected - actual
-                            unexpected = actual - expected
                             # A set avoids double-counting components repeated
                             # in the HTML or across option rows.
-                            if missing or unexpected:
+                            if missing:
                                 option_count = (
                                     str(advertised_count)
                                     if advertised_count is not None else "unknown"
@@ -701,38 +712,23 @@ def Search_for_Courses(classes: dict[str, list[Course]], result_queue: Queue,
                                     f"Fluid class numbers across {option_count} "
                                     f"advertised option(s): "
                                     f"{Format_Number_Set(actual)}; missing: "
-                                    f"{Format_Number_Set(missing)}; unexpected: "
-                                    f"{Format_Number_Set(unexpected)}.\n"
+                                    f"{Format_Number_Set(missing)}.\n"
                                 )
                                 diagnostic_lines.append(message)
                                 summary_lines.append(message)
-                                if missing:
-                                    reason = (
-                                        "CLASS_NBR was not returned by Fluid "
-                                        "Class Search detail; returned: "
-                                        + Format_Number_Set(actual)
+                                reason = (
+                                    "CLASS_NBR was not returned by Fluid "
+                                    "Class Search detail"
+                                )
+                                issue_rows.extend(
+                                    Build_Class_Issue_Rows(
+                                        course,
+                                        missing,
+                                        "MISSING_FROM_FLUID",
+                                        reason,
+                                        actual,
                                     )
-                                    issue_rows.extend(
-                                        Build_Class_Issue_Rows(
-                                            course,
-                                            missing,
-                                            "MISSING_FROM_FLUID",
-                                            reason,
-                                        )
-                                    )
-                                if unexpected:
-                                    reason = (
-                                        "CLASS_NBR was returned by Fluid Class "
-                                        "Search but is not present in the CSV"
-                                    )
-                                    issue_rows.extend(
-                                        Build_Class_Issue_Rows(
-                                            course,
-                                            unexpected,
-                                            "UNEXPECTED_IN_FLUID",
-                                            reason,
-                                        )
-                                    )
+                                )
                 except Exception as exc:
                     short_reason = Summarize_Exception(exc)
                     detailed_reason = f"{type(exc).__name__}: {exc}"
@@ -953,7 +949,7 @@ def Write_Issue_Csv(output_path: str,
 
     Args:
         output_path: Explicit destination supplied through ``--csv-output``.
-        issue_rows: Missing, unexpected, or unverified class-number rows.
+        issue_rows: Missing or unverified class-number rows.
 
     Returns:
         Number of unique rows written, or zero when no file is retained.
